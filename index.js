@@ -43,15 +43,47 @@ app.get('/api/ebay/health', (req, res) => {
   res.status(200).json({ status: 'OK' });
 });
 
-// eBay account deletion notification endpoint
+// eBay account deletion notification endpoint - handle both GET and POST
+// GET is used by eBay for verification
+app.get('/api/ebay/deletion-notification', (req, res) => {
+  console.log('Received GET verification request from eBay');
+  
+  // Check if this is a challenge request
+  const challengeCode = req.query.challenge_code;
+  
+  if (challengeCode) {
+    console.log(`Received challenge code: ${challengeCode}`);
+    // Simply respond with the same challenge code
+    return res.status(200).json({ challengeResponse: challengeCode });
+  } else {
+    return res.status(400).send('Missing challenge_code parameter');
+  }
+});
+
+// POST is used for actual deletion notifications
 app.post('/api/ebay/deletion-notification', (req, res) => {
   console.log('Received notification from eBay:', req.body);
   
-  // Check verification token from eBay headers
-  const requestToken = req.headers['x-ebay-signature'];
+  // Check for challenge in the request body (for verification)
+  if (req.body && req.body.challenge) {
+    console.log(`Received challenge in POST: ${req.body.challenge}`);
+    return res.status(200).json({ challengeResponse: req.body.challenge });
+  }
   
-  if (requestToken !== VERIFICATION_TOKEN) {
-    console.warn('Invalid verification token received:', requestToken);
+  // Check verification token from eBay headers - check multiple possible header names
+  const requestToken = req.headers['x-ebay-signature-key'] || 
+                      req.headers['x-ebay-signature'] || 
+                      req.headers['ebay-signature-key'] ||
+                      req.headers['ebay-signature'] ||
+                      req.headers['authorization'];
+  
+  // Remove "Bearer " prefix if it exists
+  const cleanToken = requestToken && requestToken.startsWith('Bearer ') 
+    ? requestToken.substring(7) 
+    : requestToken;
+  
+  if (cleanToken !== VERIFICATION_TOKEN) {
+    console.warn('Invalid verification token received:', cleanToken);
     // Still return 200 so eBay knows we received the notification
     return res.status(200).send('Received but token verification failed');
   }
