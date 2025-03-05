@@ -10,23 +10,50 @@ const PORT = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI;
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('Failed to connect to MongoDB:', err));
-
 // Create a schema for deletion notifications
 const deletionSchema = new mongoose.Schema({
+  username: String,
   userId: String,
-  timestamp: { type: Date, default: Date.now },
-  notificationData: Object
+  eiasToken: String,
+  notificationId: String,
+  eventDate: Date,
+  publishDate: Date,
+  publishAttemptCount: Number,
+  rawNotification: Object,
+  processed: { type: Boolean, default: false },
+  processedDate: Date
 });
 
 const DeletionNotification = mongoose.model('DeletionNotification', deletionSchema);
 
+// Create the DeletionLog schema
+const deletionLogSchema = new mongoose.Schema({
+  username: String,
+  userId: String,
+  eiasToken: String,
+  deletionDate: { type: Date, default: Date.now },
+  status: { 
+    type: String, 
+    enum: ['started', 'completed', 'failed', 'completed_with_errors'],
+    default: 'started'
+  },
+  details: mongoose.Schema.Types.Mixed
+}, { timestamps: true });
+
+const DeletionLog = mongoose.model('DeletionLog', deletionLogSchema);
+
 // Verification token for eBay
 const VERIFICATION_TOKEN = process.env.EBAY_VERIFICATION_TOKEN;
+
+// MongoDB Connection
+const MONGODB_URI = process.env.MONGODB_URI;
+mongoose.connect(MONGODB_URI)
+  .then(() => {
+    console.log('Connected to MongoDB');
+    // Create indexes after successful connection
+    createIndexes();
+  })
+  .catch(err => console.error('Failed to connect to MongoDB:', err));
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -61,8 +88,8 @@ app.get('/api/ebay/deletion-notification', (req, res) => {
 });
 
 // POST is used for actual deletion notifications
-app.post('/api/ebay/deletion-notification', (req, res) => {
-  console.log('Received notification from eBay:', req.body);
+app.post('/api/ebay/deletion-notification', async (req, res) => {
+  console.log('Received notification from eBay:', JSON.stringify(req.body));
   
   // Check for challenge in the request body (for verification)
   if (req.body && req.body.challenge) {
@@ -70,7 +97,7 @@ app.post('/api/ebay/deletion-notification', (req, res) => {
     return res.status(200).json({ challengeResponse: req.body.challenge });
   }
   
-  // Check verification token from eBay headers - check multiple possible header names
+  // Check verification token from eBay headers if needed
   const requestToken = req.headers['x-ebay-signature-key'] || 
                       req.headers['x-ebay-signature'] || 
                       req.headers['ebay-signature-key'] ||
@@ -82,44 +109,261 @@ app.post('/api/ebay/deletion-notification', (req, res) => {
     ? requestToken.substring(7) 
     : requestToken;
   
-  if (cleanToken !== VERIFICATION_TOKEN) {
+  if (VERIFICATION_TOKEN && cleanToken !== VERIFICATION_TOKEN) {
     console.warn('Invalid verification token received:', cleanToken);
-    // Still return 200 so eBay knows we received the notification
-    return res.status(200).send('Received but token verification failed');
+    // Log the issue but still process the notification
   }
   
   try {
-    // Extract the userId from the notification
-    // The exact structure may depend on eBay's actual notification format
-    const userId = req.body.userId || 
-                  (req.body.data && req.body.data.userId) || 
-                  'unknown-user';
-    
-    // Save the notification to MongoDB
-    const notification = new DeletionNotification({
-      userId: userId,
-      notificationData: req.body
-    });
-    
-    notification.save()
-      .then(() => {
-        console.log(`Saved deletion notification for user ${userId}`);
-        
-        // Future implementation: Add code here to delete user data
-        console.log(`TODO: Implement data deletion for user ${userId}`);
-      })
-      .catch(err => {
-        console.error('Error saving notification:', err);
+    // Validate that this is an eBay marketplace account deletion notification
+    if (req.body.metadata && 
+        req.body.metadata.topic === "MARKETPLACE_ACCOUNT_DELETION" && 
+        req.body.notification && 
+        req.body.notification.data) {
+      
+      const notificationData = req.body.notification;
+      const userData = notificationData.data;
+      
+      // Extract user identifiers from notification
+      const username = userData.username;
+      const userId = userData.userId;
+      const eiasToken = userData.eiasToken;
+      const notificationId = notificationData.notificationId;
+
+      console.log(`Processing deletion request for user: ${username}, ID: ${userId}`);
+      
+      // Save the notification to MongoDB
+      const notification = new DeletionNotification({
+        username: username,
+        userId: userId,
+        eiasToken: eiasToken,
+        notificationId: notificationId,
+        eventDate: new Date(notificationData.eventDate),
+        publishDate: new Date(notificationData.publishDate),
+        publishAttemptCount: notificationData.publishAttemptCount,
+        rawNotification: req.body
       });
-    
-    // Always respond with 200 OK to acknowledge receipt
-    return res.status(200).send('Notification received successfully');
+      
+      await notification.save();
+      console.log(`Saved deletion notification: ${notificationId}`);
+      
+      // Process the deletion
+      await processUserDeletion(username, userId, eiasToken);
+      
+      // Update the notification to mark it as processed
+      await DeletionNotification.findOneAndUpdate(
+        { notificationId: notificationId },
+        { 
+          processed: true, 
+          processedDate: new Date() 
+        }
+      );
+      
+      // Return 200 OK to acknowledge receipt
+      return res.status(200).send();
+    } else {
+      console.warn('Received notification with unexpected format:', req.body);
+      // Still respond with 200 so eBay knows we received it
+      return res.status(200).send();
+    }
   } catch (error) {
     console.error('Error processing notification:', error);
     // Still respond with 200 so eBay knows we received it
-    return res.status(200).send('Notification received with processing errors');
+    return res.status(200).send();
   }
 });
+
+/**
+ * Process user data deletion across all collections
+ * @param {string} username - The eBay username
+ * @param {string} userId - The eBay user ID
+ * @param {string} eiasToken - The eBay EIAS token
+ * @returns {Promise<boolean>} - Resolution status of the deletion
+ */
+async function processUserDeletion(username, userId, eiasToken) {
+  console.log(`Starting deletion process for eBay user: ${username} (${userId})`);
+  
+  try {
+    // Get a reference to the MongoDB database
+    const db = mongoose.connection.db;
+    
+    // 1. Create a deletion log entry to document compliance
+    const deletionLog = new DeletionLog({
+      username: username,
+      userId: userId,
+      eiasToken: eiasToken,
+      status: 'started',
+      details: { startTime: new Date() }
+    });
+    
+    await deletionLog.save();
+    console.log(`Created deletion log for user ${userId}`);
+
+    // 2. Get a list of all collections in the database
+    // This allows us to scan all collections for user data
+    const collections = await db.listCollections().toArray();
+    const collectionNames = collections.map(c => c.name);
+    
+    console.log(`Scanning ${collectionNames.length} collections for user data`);
+    
+    // Track statistics for reporting
+    const deletionStats = {
+      collectionsScanned: 0,
+      documentsDeleted: 0,
+      documentsAnonymized: 0,
+      errors: []
+    };
+
+    // 3. For each collection, delete or anonymize user data
+    for (const collectionName of collectionNames) {
+      // Skip system collections and the DeletionNotification/DeletionLog collections
+      if (collectionName.startsWith('system.') || 
+          collectionName === 'DeletionNotifications' || 
+          collectionName === 'DeletionLogs') {
+        continue;
+      }
+      
+      deletionStats.collectionsScanned++;
+      const collection = db.collection(collectionName);
+      
+      try {
+        // Look for documents with any of the user identifiers
+        // This assumes your data model uses standard field names for user IDs
+        // Adjust as needed for your specific data model
+        const userFields = [
+          { 'userId': userId },
+          { 'user.id': userId },
+          { 'user._id': userId },
+          { 'username': username },
+          { 'user.username': username },
+          { 'eiasToken': eiasToken },
+          { 'ebayUserId': userId },
+          { 'ebayUsername': username }
+        ];
+        
+        // Find documents associated with this user
+        const query = { $or: userFields };
+        const userDocuments = await collection.find(query).toArray();
+        
+        console.log(`Found ${userDocuments.length} documents in ${collectionName} collection`);
+        
+        if (userDocuments.length > 0) {
+          // Option 1: Delete the documents completely
+          const deleteResult = await collection.deleteMany(query);
+          deletionStats.documentsDeleted += deleteResult.deletedCount;
+          console.log(`Deleted ${deleteResult.deletedCount} documents from ${collectionName}`);
+          
+          // Option 2 (Alternative): Anonymize the documents instead of deleting
+          // Uncomment and modify this section if you prefer anonymization for certain collections
+          /*
+          const anonymizationUpdate = {
+            $set: {
+              username: 'DELETED_USER',
+              userId: 'DELETED_USER_' + Math.random().toString(36).substring(2, 10),
+              email: null,
+              // Add other personally identifiable fields that should be anonymized
+              personalDataRemoved: true,
+              personalDataRemovedDate: new Date()
+            }
+          };
+          
+          const anonymizeResult = await collection.updateMany(query, anonymizationUpdate);
+          deletionStats.documentsAnonymized += anonymizeResult.modifiedCount;
+          console.log(`Anonymized ${anonymizeResult.modifiedCount} documents in ${collectionName}`);
+          */
+        }
+      } catch (collectionError) {
+        console.error(`Error processing collection ${collectionName}:`, collectionError);
+        deletionStats.errors.push({
+          collection: collectionName,
+          error: collectionError.message
+        });
+      }
+    }
+    
+    // 4. Update the deletion log with results
+    await DeletionLog.findOneAndUpdate(
+      { username: username, userId: userId },
+      { 
+        status: deletionStats.errors.length > 0 ? 'completed_with_errors' : 'completed',
+        details: {
+          ...deletionLog.details,
+          completionTime: new Date(),
+          statistics: deletionStats
+        }
+      }
+    );
+    
+    console.log(`Completed deletion process for user ${username}:`, deletionStats);
+    
+    return true;
+  } catch (error) {
+    console.error(`Error during deletion process for user ${username}:`, error);
+    
+    // Log the error to the deletion log if possible
+    try {
+      await DeletionLog.findOneAndUpdate(
+        { username: username, userId: userId },
+        { 
+          status: 'failed',
+          details: {
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date()
+          }
+        }
+      );
+    } catch (logError) {
+      console.error('Failed to update deletion log:', logError);
+    }
+    
+    throw error;
+  }
+}
+
+/**
+ * Create indexes on important user identifier fields
+ * This improves performance when searching for user data during deletion
+ */
+async function createIndexes() {
+  try {
+    // 1. Index for DeletionNotification collection
+    const deletionNotificationIndexes = await DeletionNotification.collection.getIndexes();
+    
+    // Check if indexes already exist before creating them
+    if (!deletionNotificationIndexes.userId_1) {
+      await DeletionNotification.collection.createIndex({ userId: 1 });
+      console.log('Created index on DeletionNotification.userId');
+    }
+    
+    if (!deletionNotificationIndexes.username_1) {
+      await DeletionNotification.collection.createIndex({ username: 1 });
+      console.log('Created index on DeletionNotification.username');
+    }
+    
+    if (!deletionNotificationIndexes.notificationId_1) {
+      await DeletionNotification.collection.createIndex({ notificationId: 1 }, { unique: true });
+      console.log('Created unique index on DeletionNotification.notificationId');
+    }
+    
+    // 2. Index for DeletionLog collection
+    const deletionLogIndexes = await DeletionLog.collection.getIndexes();
+    
+    if (!deletionLogIndexes.userId_1) {
+      await DeletionLog.collection.createIndex({ userId: 1 });
+      console.log('Created index on DeletionLog.userId');
+    }
+    
+    if (!deletionLogIndexes.username_1) {
+      await DeletionLog.collection.createIndex({ username: 1 });
+      console.log('Created index on DeletionLog.username');
+    }
+    
+    console.log('All indexes created successfully');
+  } catch (error) {
+    console.error('Error creating indexes:', error);
+  }
+}
 
 // Start the server
 app.listen(PORT, () => {
