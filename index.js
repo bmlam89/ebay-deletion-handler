@@ -33,13 +33,18 @@ app.get('/', (req, res) => {
   res.send('eBay Deletion Handler Service');
 });
 
+// API root endpoint
+app.get('/api/ebay', (req, res) => {
+  res.send('eBay Deletion Handler API');
+});
+
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/api/ebay/health', (req, res) => {
   res.status(200).json({ status: 'OK' });
 });
 
 // eBay account deletion notification endpoint
-app.post('/ebay-deletion-notification', (req, res) => {
+app.post('/api/ebay/deletion-notification', (req, res) => {
   console.log('Received notification from eBay:', req.body);
   
   // Check verification token from eBay headers
