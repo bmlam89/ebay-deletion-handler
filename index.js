@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const mongoose = require('mongoose');
+const crypto = require('crypto'); // Add this for challenge code hashing
 require('dotenv').config();
 
 const app = express();
@@ -44,6 +45,8 @@ const DeletionLog = mongoose.model('DeletionLog', deletionLogSchema);
 
 // Verification token for eBay
 const VERIFICATION_TOKEN = process.env.EBAY_VERIFICATION_TOKEN;
+// Your endpoint URL that you provided to eBay (this should also be in your .env file)
+const ENDPOINT_URL = process.env.EBAY_ENDPOINT_URL;
 
 // MongoDB Connection
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -80,8 +83,21 @@ app.get('/api/ebay/deletion-notification', (req, res) => {
   
   if (challengeCode) {
     console.log(`Received challenge code: ${challengeCode}`);
-    // Simply respond with the same challenge code
-    return res.status(200).json({ challengeResponse: challengeCode });
+    
+    // Create hash with the values in the required order: challengeCode + verificationToken + endpoint
+    const hash = crypto.createHash('sha256');
+    hash.update(challengeCode);
+    hash.update(VERIFICATION_TOKEN);
+    hash.update(ENDPOINT_URL);
+    const responseHash = hash.digest('hex');
+    
+    console.log(`Generated challenge response: ${responseHash}`);
+    
+    // Set content-type header and respond with the proper hash format
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(200).json({ 
+      challengeResponse: responseHash 
+    });
   } else {
     return res.status(400).send('Missing challenge_code parameter');
   }
@@ -94,7 +110,15 @@ app.post('/api/ebay/deletion-notification', async (req, res) => {
   // Check for challenge in the request body (for verification)
   if (req.body && req.body.challenge) {
     console.log(`Received challenge in POST: ${req.body.challenge}`);
-    return res.status(200).json({ challengeResponse: req.body.challenge });
+    
+    // Create hash for challenge in POST request body too
+    const hash = crypto.createHash('sha256');
+    hash.update(req.body.challenge);
+    hash.update(VERIFICATION_TOKEN);
+    hash.update(ENDPOINT_URL);
+    const responseHash = hash.digest('hex');
+    
+    return res.status(200).json({ challengeResponse: responseHash });
   }
   
   // Check verification token from eBay headers if needed
