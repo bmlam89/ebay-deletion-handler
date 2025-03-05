@@ -327,41 +327,105 @@ async function processUserDeletion(username, userId, eiasToken) {
  */
 async function createIndexes() {
   try {
-    // 1. Index for DeletionNotification collection
-    const deletionNotificationIndexes = await DeletionNotification.collection.getIndexes();
+    // First ensure collections exist by inserting and then removing a dummy document
+    // This is a common pattern to ensure a collection exists before creating indexes
     
-    // Check if indexes already exist before creating them
-    if (!deletionNotificationIndexes.userId_1) {
-      await DeletionNotification.collection.createIndex({ userId: 1 });
-      console.log('Created index on DeletionNotification.userId');
+    // 1. Create DeletionNotification collection if it doesn't exist
+    try {
+      // Check if the collection exists first
+      const collections = await mongoose.connection.db.listCollections({ name: 'deletionnotifications' }).toArray();
+      if (collections.length === 0) {
+        console.log('Creating DeletionNotification collection');
+        // Insert a dummy document to create the collection
+        const dummyNotification = new DeletionNotification({
+          username: 'dummy',
+          userId: 'dummy',
+          eiasToken: 'dummy',
+          notificationId: 'dummy',
+          eventDate: new Date(),
+          publishDate: new Date(),
+          publishAttemptCount: 0,
+          rawNotification: {},
+          processed: true,
+          processedDate: new Date()
+        });
+        await dummyNotification.save();
+        
+        // Then remove it
+        await DeletionNotification.deleteOne({ notificationId: 'dummy' });
+      }
+    } catch (error) {
+      console.log('Error handling DeletionNotification collection creation:', error);
     }
     
-    if (!deletionNotificationIndexes.username_1) {
-      await DeletionNotification.collection.createIndex({ username: 1 });
-      console.log('Created index on DeletionNotification.username');
+    // 2. Create DeletionLog collection if it doesn't exist
+    try {
+      // Check if the collection exists first
+      const collections = await mongoose.connection.db.listCollections({ name: 'deletionlogs' }).toArray();
+      if (collections.length === 0) {
+        console.log('Creating DeletionLog collection');
+        // Insert a dummy document to create the collection
+        const dummyLog = new DeletionLog({
+          username: 'dummy',
+          userId: 'dummy',
+          eiasToken: 'dummy',
+          status: 'started',
+          details: { dummy: true }
+        });
+        await dummyLog.save();
+        
+        // Then remove it
+        await DeletionLog.deleteOne({ userId: 'dummy' });
+      }
+    } catch (error) {
+      console.log('Error handling DeletionLog collection creation:', error);
     }
     
-    if (!deletionNotificationIndexes.notificationId_1) {
-      await DeletionNotification.collection.createIndex({ notificationId: 1 }, { unique: true });
-      console.log('Created unique index on DeletionNotification.notificationId');
+    // Now create indexes on existing collections
+    
+    // 3. Index for DeletionNotification collection
+    try {
+      const deletionNotificationIndexes = await DeletionNotification.collection.getIndexes();
+      
+      // Check if indexes already exist before creating them
+      if (!deletionNotificationIndexes.userId_1) {
+        await DeletionNotification.collection.createIndex({ userId: 1 });
+        console.log('Created index on DeletionNotification.userId');
+      }
+      
+      if (!deletionNotificationIndexes.username_1) {
+        await DeletionNotification.collection.createIndex({ username: 1 });
+        console.log('Created index on DeletionNotification.username');
+      }
+      
+      if (!deletionNotificationIndexes.notificationId_1) {
+        await DeletionNotification.collection.createIndex({ notificationId: 1 }, { unique: true });
+        console.log('Created unique index on DeletionNotification.notificationId');
+      }
+    } catch (error) {
+      console.log('Error creating DeletionNotification indexes:', error);
     }
     
-    // 2. Index for DeletionLog collection
-    const deletionLogIndexes = await DeletionLog.collection.getIndexes();
-    
-    if (!deletionLogIndexes.userId_1) {
-      await DeletionLog.collection.createIndex({ userId: 1 });
-      console.log('Created index on DeletionLog.userId');
+    // 4. Index for DeletionLog collection
+    try {
+      const deletionLogIndexes = await DeletionLog.collection.getIndexes();
+      
+      if (!deletionLogIndexes.userId_1) {
+        await DeletionLog.collection.createIndex({ userId: 1 });
+        console.log('Created index on DeletionLog.userId');
+      }
+      
+      if (!deletionLogIndexes.username_1) {
+        await DeletionLog.collection.createIndex({ username: 1 });
+        console.log('Created index on DeletionLog.username');
+      }
+    } catch (error) {
+      console.log('Error creating DeletionLog indexes:', error);
     }
     
-    if (!deletionLogIndexes.username_1) {
-      await DeletionLog.collection.createIndex({ username: 1 });
-      console.log('Created index on DeletionLog.username');
-    }
-    
-    console.log('All indexes created successfully');
+    console.log('Index creation process completed');
   } catch (error) {
-    console.error('Error creating indexes:', error);
+    console.error('Error in index creation process:', error);
   }
 }
 
